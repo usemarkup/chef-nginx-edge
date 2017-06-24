@@ -1,0 +1,71 @@
+#!/bin/bash
+
+echo "Request IPs from https://api.fastly.com/public-ip-list"
+
+ips=`curl -s https://api.fastly.com/public-ip-list | jq -r '.addresses[]'`
+ips_to_write=()
+
+while read -r line; do
+    # Validate the line is an IPv4 Subnet
+    match=`echo $line | awk '/[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+/'`
+
+    if [ -z "$match" ]; then
+       // Invalid line??? odd.. lets do nothing
+       logger -s "ERROR Fastly retunred invalid subnets? maybe something isnt working Please investigate"
+    else
+       ips_to_write+=("$line")
+    fi
+
+done <<< "$ips"
+
+echo "${#ips_to_write[@]} IP/Subnets returned from Fastly"
+
+cat <<EOF > /tmp/fastly.nginx.conf
+# This was auto generated from /usr/local/bin/edge-nginx-fastly
+# PLEASE DO NOT MAKE MANUAL CHANGES
+
+# Use this header for the IP address of the web request
+real_ip_header X-Forwarded-For;
+real_ip_recursive on;
+
+# Deny all traffic
+deny all;
+
+# Fastly Subnets
+EOF
+
+# For each IP write them to the file
+for i in "${ips_to_write[@]}"
+do
+   :
+   echo "set_real_ip_from $i;" >> /tmp/fastly.nginx.conf
+   echo "allow $i;" >> /tmp/fastly.nginx.conf
+done
+
+# Diff the tmp file and current nginx file
+diff /tmp/fastly.nginx.conf /etc/nginx/fastly.nginx.conf > /dev/null
+isDifferent=$?
+
+# Diff will a non-zero exit code for anything thats different or the file does not exist
+# i.e. means we need to update the real configuration file & reload nginx
+if [ "$isDifferent" -ne 0 ]; then
+    logger -s "Updating Nginx Fastly Subnets"
+
+    echo "different & reload nginx"
+    cp -R /tmp/fastly.nginx.conf /etc/nginx/fastly.nginx.conf
+
+    # Lets restart Nginx to apply, it will retunr a non-zero if failure
+    # but the server will still be running in the old configuration
+    <%=@service_reload_command%>
+
+    if [ "$?" -ne 0 ]; then
+        logger -s "ERROR updating Fastly Nginx rules! Please investigate"
+
+        exit 1
+    fi
+else
+    logger -s "Nginx Fastly Subnets are correct"
+
+    echo "Nginx configuration file is already correct."
+
+fi
